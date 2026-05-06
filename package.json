@@ -1,0 +1,20 @@
+{
+  "name": "crafy-captcha",
+  "version": "1.0.0",
+  "description": "Oficial SDK (Port) of CrafyCAPTCHA for Node.js",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "captcha",
+    "crafy",
+    "security",
+    "anti-bot"
+  ],
+  "author": "CrafyCAPTCHA <hello@captcha.crafy.net>",
+  "license": "MIT",
+  "dependencies": {
+    "libsodium-wrappers": "^0.7.16"
+  }
+}
