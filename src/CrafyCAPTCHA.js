@@ -11,7 +11,7 @@ class CrafyCAPTCHA {
    * @param {string} secretKey La llave secreta (sk_...)
    * @param {string} baseUrl URL de la API (por defecto producción)
    */
-  constructor(publicKey, secretKey, baseUrl = 'https://captcha.crafy.net') {
+  constructor(publicKey, secretKey, baseUrl = 'https://captcha.crafy.net/api') {
     this.publicKey = publicKey;
     this.secretKey = secretKey;
     this.baseUrl = baseUrl.replace(/\/$/, '');

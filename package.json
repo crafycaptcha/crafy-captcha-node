@@ -1,10 +1,14 @@
 {
   "name": "crafy-captcha",
-  "version": "1.0.0",
-  "description": "Oficial SDK (Port) of CrafyCAPTCHA for Node.js",
+  "version": "1.0.1",
+  "description": "Official SDK (Port) of CrafyCAPTCHA for Node.js",
   "main": "index.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/crafycaptcha/crafy-captcha-node.git"
   },
   "keywords": [
     "captcha",

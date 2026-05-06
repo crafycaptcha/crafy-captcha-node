@@ -2,6 +2,8 @@
 
 Implementation of CrafyCAPTCHA for backend in Node.js
 
+Official documentation in https://captcha.crafy.net/docs/
+
 ## Installation
 
 ```bash
