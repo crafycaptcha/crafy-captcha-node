@@ -26,6 +26,7 @@ class CrafyCAPTCHA {
 
     // Estado interno
     this.accessToken = null;
+    this.publicToken = null;
     this.lastFlowVerifyError = null;
 
     // Configuración de rutas (Síncrono en el constructor)
@@ -67,6 +68,15 @@ class CrafyCAPTCHA {
   setRetryStatusCodes(codes) {
     this.retryStatusCodes = codes;
     return this;
+  }
+
+  /**
+   * Obtiene el Public Token dinámicamente.
+   * Si no está en memoria o caché, dispara la autenticación.
+   */
+  async getPublicToken() {
+    await this.ensureAuth();
+    return this.publicToken;
   }
 
   /**
@@ -248,40 +258,60 @@ class CrafyCAPTCHA {
   }
 
   async ensureAuth(forceRefresh = false) {
-    if (!forceRefresh && this.accessToken) return;
+    if (!forceRefresh && this.accessToken && this.publicToken) return;
 
     if (!forceRefresh) {
       try {
-        const cacheContent = await fs.readFile(this.cacheFile, 'utf8');
-        const cached = JSON.parse(cacheContent);
-        if (cached.token && cached.expires_at && Date.now() / 1000 < (cached.expires_at - 60)) {
-          this.accessToken = cached.token;
-          return;
+        const rawContent = await fs.readFile(this.cacheFile, 'utf8');
+        if (rawContent) {
+          // Intentamos desencriptar la caché con la secretKey
+          const decrypted = await this._decrypt(rawContent);
+          if (decrypted) {
+            const cached = JSON.parse(decrypted);
+
+            if (cached.token && cached.public_token && cached.expires_at) {
+              if (Date.now() / 1000 < (cached.expires_at - 60)) {
+                this.accessToken = cached.token;
+                this.publicToken = cached.public_token;
+                return;
+              }
+            }
+          }
         }
-      } catch (err) { } // Archivo no existe o JSON inválido
+      } catch (err) { } // Archivo no existe, corrupción o JSON inválido
     }
 
     const authPayload = { public_key: this.publicKey, secret_key: this.secretKey };
     const response = await this.sendRequest('authenticate', authPayload, false);
 
-    if (!response.token) {
-      throw new Error("CrafyCAPTCHA SDK: No se recibió token de autenticación.");
+    if (!response.token || !response.public_token) {
+      throw new Error("CrafyCAPTCHA SDK: Error en la respuesta de autenticación.");
     }
 
     this.accessToken = response.token;
-    const expiresIn = parseInt(response.expires_in || 3600, 10);
-    await this._saveCache(this.accessToken, Math.floor(Date.now() / 1000) + expiresIn);
+    this.publicToken = response.public_token;
+
+    const expiresIn = parseInt(response.expires_in || 86400, 10); // 24hs por defecto
+    await this._saveCache(this.accessToken, this.publicToken, Math.floor(Date.now() / 1000) + expiresIn);
   }
 
-  async _saveCache(token, expiresAt) {
-    const data = JSON.stringify({ token, expires_at: expiresAt });
+  async _saveCache(token, publicToken, expiresAt) {
+    const data = JSON.stringify({
+      token,
+      public_token: publicToken,
+      expires_at: expiresAt
+    });
+
     try {
-      await fs.writeFile(this.cacheFile, data, { mode: 0o600 });
+      // Encriptamos los datos sensibles antes de escribirlos en el directorio temporal
+      const encryptedData = await this._encrypt(data);
+      await fs.writeFile(this.cacheFile, encryptedData, { mode: 0o600 });
     } catch (err) { }
   }
 
   async clearCache() {
     this.accessToken = null;
+    this.publicToken = null;
     try {
       await fs.unlink(this.cacheFile);
     } catch (err) { }
@@ -392,7 +422,7 @@ class CrafyCAPTCHA {
   }
 
   /**
-   * MÉTODOS CRIPTOGRÁFICOS (Equivalente a BitBookLiteCryptor en PHP)
+   * MÉTODOS CRIPTOGRÁFICOS
    */
   async _initSodiumKeys() {
     await sodium.ready;
