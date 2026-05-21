@@ -4,10 +4,26 @@ const os = require('os');
 const crypto = require('crypto');
 const sodium = require('libsodium-wrappers');
 
-/**
- * Contrato de Almacenamiento (Storage Interface).
- * Cualquier adaptador personalizado debe implementar estos métodos asíncronos.
- */
+// ============================================================================
+// EXCEPCIONES PERSONALIZADAS
+// ============================================================================
+class CrafyException extends Error {
+  constructor(message, statusCode = null, cause = null) {
+    super(message);
+    this.name = this.constructor.name;
+    this.statusCode = statusCode;
+    if (cause) {
+      this.cause = cause;
+    }
+  }
+}
+class CrafyNetworkException extends CrafyException { }
+class CrafyCryptoException extends CrafyException { }
+class CrafyValidationException extends CrafyException { }
+
+// ============================================================================
+// ESTRATEGIAS DE ALMACENAMIENTO (Storage Adapters)
+// ============================================================================
 class StorageAdapter {
   async init() { }
   async getCache(key) { return null; }
@@ -31,7 +47,8 @@ class FileStorage extends StorageAdapter {
 
   async init() {
     try {
-      await fs.mkdir(this.nonceDir, { recursive: true });
+      // FIX de Seguridad: Permisos 0o700 para evitar que otros usuarios lean/borren en entornos compartidos
+      await fs.mkdir(this.nonceDir, { recursive: true, mode: 0o700 });
     } catch (err) { }
   }
 
@@ -47,6 +64,7 @@ class FileStorage extends StorageAdapter {
   async setCache(key, data, expiresAt) {
     const filePath = path.join(this.cacheDir, `${key}.json`);
     try {
+      // mode: 0o600 para que solo tu proceso tenga acceso al archivo de credenciales
       await fs.writeFile(filePath, data, { mode: 0o600 });
     } catch (err) { }
   }
@@ -68,7 +86,7 @@ class FileStorage extends StorageAdapter {
   async consumeNonce(nonce) {
     const filePath = path.join(this.nonceDir, `nonce_${nonce}.lock`);
     try {
-      // fs.unlink arroja error si el archivo no existe, lo cual actúa como bloqueo atómico
+      // La desvinculación (unlink) del sistema de archivos es atómica
       await fs.unlink(filePath);
       return true;
     } catch (err) {
@@ -95,7 +113,6 @@ class FileStorage extends StorageAdapter {
       const files = await fs.readdir(this.nonceDir);
       const lockFiles = files.filter(f => f.startsWith('nonce_') && f.endsWith('.lock'));
 
-      // Limpieza si hay muchos archivos o con probabilidad aleatoria baja (1%)
       if (lockFiles.length > 50 || Math.random() < 0.01) {
         const now = Date.now();
         for (const file of lockFiles) {
@@ -112,9 +129,9 @@ class FileStorage extends StorageAdapter {
   }
 }
 
-/**
- * Cliente Principal SDK CrafyCAPTCHA
- */
+// ============================================================================
+// CLIENTE PRINCIPAL
+// ============================================================================
 class CrafyCAPTCHA {
   constructor(publicKey, secretKey, baseUrl = 'https://captcha.crafy.net/api') {
     this.publicKey = publicKey;
@@ -130,24 +147,18 @@ class CrafyCAPTCHA {
     // Estado interno
     this.accessToken = null;
     this.publicToken = null;
+    this.tokenExpiresAt = null; // FIX de Rendimiento: Persistencia en RAM
     this.lastFlowVerifyError = null;
 
     // Por defecto, inicializamos el almacenamiento basado en archivos
     this.storage = new FileStorage(os.tmpdir());
   }
 
-  /**
-   * Inyecta un sistema de almacenamiento personalizado
-   * @param {StorageAdapter} storageAdapter Instancia de tu adaptador personalizado
-   */
   setStorage(storageAdapter) {
     this.storage = storageAdapter;
     return this;
   }
 
-  /**
-   * @deprecated Usa setStorage(new FileStorage(dirPath))
-   */
   setTempDir(dirPath) {
     this.storage = new FileStorage(dirPath);
     return this;
@@ -182,9 +193,15 @@ class CrafyCAPTCHA {
       await this.storage.init();
     }
 
-    const nonce = crypto.randomBytes(32).toString('hex');
-    const expiresAt = Date.now() + 1200000; // TTL 20 mins
+    let nonce;
+    try {
+      // FIX Criptográfico: Protección ante fallos de entropía del SO
+      nonce = crypto.randomBytes(32).toString('hex');
+    } catch (err) {
+      throw new CrafyCryptoException("CrafyCAPTCHA: Error del sistema al generar entropía segura.", null, err);
+    }
 
+    const expiresAt = Date.now() + 1200000; // TTL 20 mins
     await this.storage.storeNonce(nonce, expiresAt);
 
     const flowData = { ...options, nonce };
@@ -222,7 +239,6 @@ class CrafyCAPTCHA {
     const payloadJson = envelope.payload;
     const signature = envelope.server_sign;
 
-    // Validar Firma HMAC
     const expectedSignature = crypto.createHmac('sha256', this.secretKey)
       .update(payloadJson)
       .digest('hex');
@@ -275,14 +291,13 @@ class CrafyCAPTCHA {
       return false;
     }
 
-    // Intento de consumo atómico en el adaptador de almacenamiento
     const consumed = await this.storage.consumeNonce(cleanNonce);
     if (!consumed) {
       this.lastFlowVerifyError = 'Nonce ya utilizado (Replay Attack) o expirado.';
       return false;
     }
 
-    // Garbage Collection asíncrono
+    // Limpieza asíncrona (no bloqueante)
     this.storage.gcNonces().catch(() => { });
 
     return true;
@@ -302,6 +317,7 @@ class CrafyCAPTCHA {
     try {
       return await this.sendRequest(action, data, true);
     } catch (err) {
+      // Se reintenta solo frente a errores legítimos de autenticación
       if (err.statusCode === 401) {
         await this.clearCache();
         await this.ensureAuth(true);
@@ -312,7 +328,10 @@ class CrafyCAPTCHA {
   }
 
   async ensureAuth(forceRefresh = false) {
-    if (!forceRefresh && this.accessToken && this.publicToken) return;
+    // FIX de Rendimiento: Leemos directamente desde la RAM si es válido
+    if (!forceRefresh && this.accessToken && this.publicToken && this.tokenExpiresAt) {
+      if (Date.now() / 1000 < (this.tokenExpiresAt - 60)) return;
+    }
 
     if (!forceRefresh) {
       const rawContent = await this.storage.getCache(this._getCacheKey());
@@ -325,6 +344,8 @@ class CrafyCAPTCHA {
               if (Date.now() / 1000 < (cached.expires_at - 60)) {
                 this.accessToken = cached.token;
                 this.publicToken = cached.public_token;
+                // FIX Crítico (Amnesia de Caché): Llenamos la memoria RAM también para no volver a leer del disco
+                this.tokenExpiresAt = parseInt(cached.expires_at, 10);
                 return;
               }
             }
@@ -337,14 +358,16 @@ class CrafyCAPTCHA {
     const response = await this.sendRequest('authenticate', authPayload, false);
 
     if (!response.token || !response.public_token) {
-      throw new Error("CrafyCAPTCHA SDK: Error en la respuesta de autenticación.");
+      throw new CrafyValidationException("CrafyCAPTCHA SDK: Error en la respuesta de autenticación.");
     }
 
     this.accessToken = response.token;
     this.publicToken = response.public_token;
 
     const expiresIn = parseInt(response.expires_in || 86400, 10);
-    await this._saveCache(this.accessToken, this.publicToken, Math.floor(Date.now() / 1000) + expiresIn);
+    this.tokenExpiresAt = Math.floor(Date.now() / 1000) + expiresIn;
+
+    await this._saveCache(this.accessToken, this.publicToken, this.tokenExpiresAt);
   }
 
   async _saveCache(token, publicToken, expiresAt) {
@@ -356,6 +379,7 @@ class CrafyCAPTCHA {
   async clearCache() {
     this.accessToken = null;
     this.publicToken = null;
+    this.tokenExpiresAt = null;
     await this.storage.deleteCache(this._getCacheKey());
   }
 
@@ -365,7 +389,7 @@ class CrafyCAPTCHA {
     const headers = {
       'Content-Type': 'application/json',
       'Accept': 'application/json',
-      'User-Agent': 'CrafyCAPTCHA-Node-SDK/2.2'
+      'User-Agent': 'CrafyCAPTCHA-Node-SDK/2.3'
     };
 
     if (useAuth && this.accessToken) {
@@ -387,7 +411,10 @@ class CrafyCAPTCHA {
           signal: AbortSignal.timeout(this.timeout)
         });
       } catch (networkErr) {
-        if (attempt >= maxAttempts) throw new Error(`CrafyCAPTCHA Network Error: ${networkErr.message}`);
+        if (attempt >= maxAttempts) {
+          // FIX: Lanzamos la excepción de red personalizada
+          throw new CrafyNetworkException(`CrafyCAPTCHA Network Error: ${networkErr.message}`, null, networkErr);
+        }
         await this._delay(this._calculateBackoff(attempt));
         continue;
       }
@@ -411,9 +438,7 @@ class CrafyCAPTCHA {
       }
 
       if (httpCode === 401) {
-        const err = new Error("Unauthorized");
-        err.statusCode = 401;
-        throw err;
+        throw new CrafyValidationException("Unauthorized (Invalid Keys)", 401);
       }
 
       let resultRaw = await response.text();
@@ -422,31 +447,26 @@ class CrafyCAPTCHA {
       try {
         jsonResp = JSON.parse(resultRaw);
       } catch (e) {
+        // FIX: Parseo estricto del JSON protegido bajo nuestras excepciones de red/validación
         if (httpCode >= 400) {
-          const err = new Error(`CrafyCAPTCHA HTTP Error (${httpCode})`);
-          err.statusCode = httpCode;
-          throw err;
+          throw new CrafyNetworkException(`CrafyCAPTCHA HTTP Error (${httpCode})`, httpCode, e);
         }
-        throw new Error(`CrafyCAPTCHA API Error: Respuesta inválida. HTTP Code: ${httpCode}`);
+        throw new CrafyNetworkException(`CrafyCAPTCHA API Error: Respuesta inválida. HTTP Code: ${httpCode}. Detalles: ${e.message}`, httpCode, e);
       }
 
       if (jsonResp.status === 'error') {
         const msg = jsonResp.message || 'Error desconocido';
-        const err = new Error(msg);
-        err.statusCode = httpCode;
-        throw err;
+        throw new CrafyValidationException(msg, httpCode);
       }
 
       if (httpCode >= 400) {
-        const err = new Error(`CrafyCAPTCHA HTTP Error (${httpCode})`);
-        err.statusCode = httpCode;
-        throw err;
+        throw new CrafyNetworkException(`CrafyCAPTCHA HTTP Error (${httpCode})`, httpCode);
       }
 
       return jsonResp.data || {};
     }
 
-    throw new Error("CrafyCAPTCHA: Max retries exceeded.");
+    throw new CrafyNetworkException("CrafyCAPTCHA: Max retries exceeded.");
   }
 
   _calculateBackoff(attempt) {
@@ -464,109 +484,122 @@ class CrafyCAPTCHA {
   }
 
   async _encrypt(plaintext, version = 3) {
-    await this._initSodiumKeys();
+    try {
+      await this._initSodiumKeys();
 
-    if (version === 3) {
-      const nonce = sodium.randombytes_buf(sodium.crypto_aead_xchacha20poly1305_ietf_NPUBBYTES);
-      const ciphertext = sodium.crypto_aead_xchacha20poly1305_ietf_encrypt(
-        plaintext, null, null, nonce, this.v3Key
-      );
-      const combined = new Uint8Array(nonce.length + ciphertext.length);
-      combined.set(nonce);
-      combined.set(ciphertext, nonce.length);
-      return ';v3_;' + Buffer.from(combined).toString('base64');
-    } else if (version === 2) {
-      const salt = sodium.randombytes_buf(sodium.crypto_pwhash_SALTBYTES);
-      const key = sodium.crypto_pwhash(
-        sodium.crypto_aead_xchacha20poly1305_ietf_KEYBYTES,
-        this.secretKey, salt,
-        sodium.crypto_pwhash_OPSLIMIT_INTERACTIVE,
-        sodium.crypto_pwhash_MEMLIMIT_INTERACTIVE,
-        sodium.crypto_pwhash_ALG_DEFAULT
-      );
-      const nonce = sodium.randombytes_buf(sodium.crypto_aead_xchacha20poly1305_ietf_NPUBBYTES);
-      const ciphertext = sodium.crypto_aead_xchacha20poly1305_ietf_encrypt(
-        plaintext, null, null, nonce, key
-      );
-      sodium.memzero(key);
-      const combined = new Uint8Array(salt.length + nonce.length + ciphertext.length);
-      combined.set(salt);
-      combined.set(nonce, salt.length);
-      combined.set(ciphertext, salt.length + nonce.length);
-      return ';v2_;' + Buffer.from(combined).toString('base64');
-    } else {
-      const iv = crypto.randomBytes(16);
-      const cipher = crypto.createCipheriv('aes-256-cbc', this.v1Key, iv);
-      let cipherText = cipher.update(plaintext);
-      cipherText = Buffer.concat([cipherText, cipher.final()]);
-      const hash = crypto.createHmac('sha256', this.v1Key).update(cipherText).digest();
-      return Buffer.concat([iv, hash, cipherText]).toString('hex');
+      if (version === 3) {
+        const nonce = sodium.randombytes_buf(sodium.crypto_aead_xchacha20poly1305_ietf_NPUBBYTES);
+        const ciphertext = sodium.crypto_aead_xchacha20poly1305_ietf_encrypt(
+          plaintext, null, null, nonce, this.v3Key
+        );
+        const combined = new Uint8Array(nonce.length + ciphertext.length);
+        combined.set(nonce);
+        combined.set(ciphertext, nonce.length);
+        return ';v3_;' + Buffer.from(combined).toString('base64');
+      } else if (version === 2) {
+        const salt = sodium.randombytes_buf(sodium.crypto_pwhash_SALTBYTES);
+        const key = sodium.crypto_pwhash(
+          sodium.crypto_aead_xchacha20poly1305_ietf_KEYBYTES,
+          this.secretKey, salt,
+          sodium.crypto_pwhash_OPSLIMIT_INTERACTIVE,
+          sodium.crypto_pwhash_MEMLIMIT_INTERACTIVE,
+          sodium.crypto_pwhash_ALG_DEFAULT
+        );
+        const nonce = sodium.randombytes_buf(sodium.crypto_aead_xchacha20poly1305_ietf_NPUBBYTES);
+        const ciphertext = sodium.crypto_aead_xchacha20poly1305_ietf_encrypt(
+          plaintext, null, null, nonce, key
+        );
+        sodium.memzero(key);
+        const combined = new Uint8Array(salt.length + nonce.length + ciphertext.length);
+        combined.set(salt);
+        combined.set(nonce, salt.length);
+        combined.set(ciphertext, salt.length + nonce.length);
+        return ';v2_;' + Buffer.from(combined).toString('base64');
+      } else {
+        const iv = crypto.randomBytes(16);
+        const cipher = crypto.createCipheriv('aes-256-cbc', this.v1Key, iv);
+        let cipherText = cipher.update(plaintext);
+        cipherText = Buffer.concat([cipherText, cipher.final()]);
+        const hash = crypto.createHmac('sha256', this.v1Key).update(cipherText).digest();
+        return Buffer.concat([iv, hash, cipherText]).toString('hex');
+      }
+    } catch (e) {
+      // FIX Criptográfico: Manejo estricto si algún módulo de encriptación arroja un TypeError
+      throw new CrafyCryptoException("Error interno: Fallo al encriptar el payload.", null, e);
     }
   }
 
   async _decrypt(input) {
-    await this._initSodiumKeys();
-    const firstChars = input.substring(0, 5);
+    try {
+      await this._initSodiumKeys();
+      const firstChars = input.substring(0, 5);
 
-    if (firstChars === ';v3_;') {
-      const decoded = Buffer.from(input.substring(5), 'base64');
-      const nonceLen = sodium.crypto_aead_xchacha20poly1305_ietf_NPUBBYTES;
-      if (decoded.length < nonceLen) return null;
-      const nonce = new Uint8Array(decoded.subarray(0, nonceLen));
-      const ciphertext = new Uint8Array(decoded.subarray(nonceLen));
-      try {
-        const plaintext = sodium.crypto_aead_xchacha20poly1305_ietf_decrypt(
-          null, ciphertext, null, nonce, this.v3Key
+      if (firstChars === ';v3_;') {
+        const decoded = Buffer.from(input.substring(5), 'base64');
+        const nonceLen = sodium.crypto_aead_xchacha20poly1305_ietf_NPUBBYTES;
+        if (decoded.length < nonceLen) return null;
+        const nonce = new Uint8Array(decoded.subarray(0, nonceLen));
+        const ciphertext = new Uint8Array(decoded.subarray(nonceLen));
+        try {
+          const plaintext = sodium.crypto_aead_xchacha20poly1305_ietf_decrypt(
+            null, ciphertext, null, nonce, this.v3Key
+          );
+          return Buffer.from(plaintext).toString('utf8');
+        } catch (e) { return null; }
+      } else if (firstChars === ';v2_;') {
+        const decoded = Buffer.from(input.substring(5), 'base64');
+        const saltLen = sodium.crypto_pwhash_SALTBYTES;
+        const nonceLen = sodium.crypto_aead_xchacha20poly1305_ietf_NPUBBYTES;
+        if (decoded.length < (saltLen + nonceLen + 1)) return null;
+        const salt = new Uint8Array(decoded.subarray(0, saltLen));
+        const nonce = new Uint8Array(decoded.subarray(saltLen, saltLen + nonceLen));
+        const ciphertext = new Uint8Array(decoded.subarray(saltLen + nonceLen));
+        const key = sodium.crypto_pwhash(
+          sodium.crypto_aead_xchacha20poly1305_ietf_KEYBYTES,
+          this.secretKey, salt,
+          sodium.crypto_pwhash_OPSLIMIT_INTERACTIVE,
+          sodium.crypto_pwhash_MEMLIMIT_INTERACTIVE,
+          sodium.crypto_pwhash_ALG_DEFAULT
         );
-        return Buffer.from(plaintext).toString('utf8');
-      } catch (e) { return null; }
-    } else if (firstChars === ';v2_;') {
-      const decoded = Buffer.from(input.substring(5), 'base64');
-      const saltLen = sodium.crypto_pwhash_SALTBYTES;
-      const nonceLen = sodium.crypto_aead_xchacha20poly1305_ietf_NPUBBYTES;
-      if (decoded.length < (saltLen + nonceLen + 1)) return null;
-      const salt = new Uint8Array(decoded.subarray(0, saltLen));
-      const nonce = new Uint8Array(decoded.subarray(saltLen, saltLen + nonceLen));
-      const ciphertext = new Uint8Array(decoded.subarray(saltLen + nonceLen));
-      const key = sodium.crypto_pwhash(
-        sodium.crypto_aead_xchacha20poly1305_ietf_KEYBYTES,
-        this.secretKey, salt,
-        sodium.crypto_pwhash_OPSLIMIT_INTERACTIVE,
-        sodium.crypto_pwhash_MEMLIMIT_INTERACTIVE,
-        sodium.crypto_pwhash_ALG_DEFAULT
-      );
-      try {
-        const plaintext = sodium.crypto_aead_xchacha20poly1305_ietf_decrypt(
-          null, ciphertext, null, nonce, key
-        );
-        sodium.memzero(key);
-        return Buffer.from(plaintext).toString('utf8');
-      } catch (e) {
-        sodium.memzero(key);
-        return null;
+        try {
+          const plaintext = sodium.crypto_aead_xchacha20poly1305_ietf_decrypt(
+            null, ciphertext, null, nonce, key
+          );
+          sodium.memzero(key);
+          return Buffer.from(plaintext).toString('utf8');
+        } catch (e) {
+          sodium.memzero(key);
+          return null;
+        }
+      } else {
+        if (input.length % 2 !== 0 || !/^[0-9a-fA-F]+$/.test(input)) return null;
+        const binaryInput = Buffer.from(input, 'hex');
+        if (binaryInput.length < 48) return null;
+        const iv = binaryInput.subarray(0, 16);
+        const hash = binaryInput.subarray(16, 48);
+        const cipherText = binaryInput.subarray(48);
+        const calculatedHash = crypto.createHmac('sha256', this.v1Key).update(cipherText).digest();
+        if (!crypto.timingSafeEqual(hash, calculatedHash)) return null;
+        try {
+          const decipher = crypto.createDecipheriv('aes-256-cbc', this.v1Key, iv);
+          let plaintext = decipher.update(cipherText);
+          plaintext = Buffer.concat([plaintext, decipher.final()]);
+          return plaintext.toString('utf8');
+        } catch (e) { return null; }
       }
-    } else {
-      if (input.length % 2 !== 0 || !/^[0-9a-fA-F]+$/.test(input)) return null;
-      const binaryInput = Buffer.from(input, 'hex');
-      if (binaryInput.length < 48) return null;
-      const iv = binaryInput.subarray(0, 16);
-      const hash = binaryInput.subarray(16, 48);
-      const cipherText = binaryInput.subarray(48);
-      const calculatedHash = crypto.createHmac('sha256', this.v1Key).update(cipherText).digest();
-      if (!crypto.timingSafeEqual(hash, calculatedHash)) return null;
-      try {
-        const decipher = crypto.createDecipheriv('aes-256-cbc', this.v1Key, iv);
-        let plaintext = decipher.update(cipherText);
-        plaintext = Buffer.concat([plaintext, decipher.final()]);
-        return plaintext.toString('utf8');
-      } catch (e) { return null; }
+    } catch (e) {
+      return null; // Si se inyecta contenido corrupto, fallamos silenciosamente retornando null
     }
   }
 }
 
-// Exportamos la clase principal y la clase base de Storage para que puedan extenderla
+// Exportamos todo para uso externo
 module.exports = {
   CrafyCAPTCHA,
   StorageAdapter,
-  FileStorage
+  FileStorage,
+  CrafyException,
+  CrafyNetworkException,
+  CrafyCryptoException,
+  CrafyValidationException
 };
