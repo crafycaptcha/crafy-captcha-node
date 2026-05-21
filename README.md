@@ -13,7 +13,7 @@ npm install crafy-captcha
 ## Basic use
 
 ```javascript
-const CrafyCAPTCHA = require('crafy-captcha');
+const {CrafyCAPTCHA} = require('crafy-captcha');
 
 async function test() {
     const captcha = new CrafyCAPTCHA('pk_your_public', 'sk_your_secret');
