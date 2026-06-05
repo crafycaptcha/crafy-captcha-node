@@ -55,7 +55,21 @@ class FileStorage extends StorageAdapter {
   async getCache(key) {
     const filePath = path.join(this.cacheDir, `${key}.json`);
     try {
-      return await fs.readFile(filePath, 'utf8');
+      const content = await fs.readFile(filePath, 'utf8');
+      try {
+        const decoded = JSON.parse(content);
+        if (decoded && typeof decoded.e === 'number' && decoded.d !== undefined) {
+          if (Math.floor(Date.now() / 1000) <= decoded.e) {
+            return String(decoded.d);
+          }
+          await fs.unlink(filePath).catch(() => { });
+          return null;
+        }
+      } catch (parseErr) {
+        // Backward compatibility for old raw encrypted cache files
+        return content;
+      }
+      return null;
     } catch (err) {
       return null;
     }
@@ -65,7 +79,8 @@ class FileStorage extends StorageAdapter {
     const filePath = path.join(this.cacheDir, `${key}.json`);
     try {
       // mode: 0o600 para que solo tu proceso tenga acceso al archivo de credenciales
-      await fs.writeFile(filePath, data, { mode: 0o600 });
+      const payload = JSON.stringify({ e: expiresAt, d: data });
+      await fs.writeFile(filePath, payload, { mode: 0o600 });
     } catch (err) { }
   }
 
@@ -118,10 +133,32 @@ class FileStorage extends StorageAdapter {
         for (const file of lockFiles) {
           const filePath = path.join(this.nonceDir, file);
           try {
-            const stats = await fs.stat(filePath);
-            if (now - stats.mtimeMs > 1200000) { // 20 min TTL
+            const content = await fs.readFile(filePath, 'utf8');
+            const ttl = parseInt(content, 10);
+            if (!isNaN(ttl) && now > ttl) {
               await fs.unlink(filePath);
+            } else if (isNaN(ttl)) {
+              await fs.unlink(filePath); // Si está corrupto, se borra
             }
+          } catch (e) { }
+        }
+      }
+
+      // Limpiar archivos de caché json
+      if (Math.random() < 0.01) {
+        const cacheFiles = await fs.readdir(this.cacheDir);
+        const jsonFiles = cacheFiles.filter(f => f.endsWith('.json'));
+        const nowSec = Math.floor(Date.now() / 1000);
+        for (const file of jsonFiles) {
+          const filePath = path.join(this.cacheDir, file);
+          try {
+            const content = await fs.readFile(filePath, 'utf8');
+            try {
+              const decoded = JSON.parse(content);
+              if (decoded && typeof decoded.e === 'number' && nowSec > decoded.e) {
+                await fs.unlink(filePath);
+              }
+            } catch (e) { }
           } catch (e) { }
         }
       }
@@ -204,13 +241,18 @@ class CrafyCAPTCHA {
     const expiresAt = Date.now() + 1200000; // TTL 20 mins
     await this.storage.storeNonce(nonce, expiresAt);
 
+    if (options.context && typeof options.context === 'object') {
+      await this.storage.setCache('nonce_context_' + nonce, JSON.stringify(options.context), Math.floor(expiresAt / 1000));
+      delete options.context;
+    }
+
     const flowData = { ...options, nonce };
     const jsonOptions = JSON.stringify(flowData);
 
     return await this._encrypt(jsonOptions);
   }
 
-  async verifyFlow(base64Payload) {
+  async verifyFlow(base64Payload, expectedContext = null) {
     this.lastFlowVerifyError = null;
 
     if (typeof this.storage.init === 'function') {
@@ -286,9 +328,34 @@ class CrafyCAPTCHA {
     }
 
     const cleanNonce = decryptedNonce.replace(/[^a-f0-9]/g, '');
-    if (cleanNonce !== decryptedNonce) {
-      this.lastFlowVerifyError = 'Nonce inválido.';
+    if (cleanNonce !== decryptedNonce || cleanNonce.length !== 64) {
+      this.lastFlowVerifyError = 'Nonce inválido o de longitud incorrecta.';
       return false;
+    }
+
+    if (expectedContext !== null) {
+      const savedContextJson = await this.storage.getCache('nonce_context_' + cleanNonce);
+      if (!savedContextJson) {
+        this.lastFlowVerifyError = 'Context mismatch (no context saved for this flow or already used).';
+        return false;
+      }
+
+      try {
+        const savedContext = JSON.parse(savedContextJson);
+        if (typeof savedContext !== 'object' || savedContext === null) {
+          this.lastFlowVerifyError = 'Context mismatch (invalid saved context).';
+          return false;
+        }
+        for (const [key, expectedValue] of Object.entries(expectedContext)) {
+          if (!(key in savedContext) || savedContext[key] !== expectedValue) {
+            this.lastFlowVerifyError = `Context mismatch on key '${key}'.`;
+            return false;
+          }
+        }
+      } catch (e) {
+        this.lastFlowVerifyError = 'Context mismatch (invalid saved context JSON).';
+        return false;
+      }
     }
 
     const consumed = await this.storage.consumeNonce(cleanNonce);
@@ -296,6 +363,9 @@ class CrafyCAPTCHA {
       this.lastFlowVerifyError = 'Nonce ya utilizado (Replay Attack) o expirado.';
       return false;
     }
+
+    // Limpiar el contexto si fue utilizado (para liberar espacio)
+    await this.storage.deleteCache('nonce_context_' + cleanNonce);
 
     // Limpieza asíncrona (no bloqueante)
     this.storage.gcNonces().catch(() => { });

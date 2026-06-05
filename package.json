@@ -1,6 +1,6 @@
 {
   "name": "crafy-captcha",
-  "version": "1.0.4",
+  "version": "1.0.6",
   "description": "Official SDK (Port) of CrafyCAPTCHA for Node.js",
   "main": "index.js",
   "scripts": {
@@ -16,6 +16,9 @@
     "security",
     "anti-bot"
   ],
+  "engines": {
+    "node": ">=18.0.0"
+  },
   "author": "CrafyCAPTCHA <hello@captcha.crafy.net>",
   "license": "MIT",
   "dependencies": {
